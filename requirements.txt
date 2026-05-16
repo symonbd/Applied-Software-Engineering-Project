@@ -1,0 +1,4 @@
+requests
+beautifulsoup4
+tqdm
+pip install -r requirements.txt
