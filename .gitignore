@@ -1,9 +1,17 @@
-cat << 'EOF' > .gitignore
 # Credentials — NEVER upload
 .env
+access.env
+*.env
+!.env.example
 
 # Downloaded data files (too large for GitHub)
 downloads/
+
+# Intermediate working database -- not a rubric deliverable.
+# populate_from_disk.py rebuilds this from the seeding db + downloads/;
+# classifier.py copies it into 23088045-sq26-classification.db, which IS
+# the required Part 2 submission. Keep this one local only.
+23088045-sq26.db
 
 # Python
 __pycache__/
@@ -15,4 +23,28 @@ venv/
 
 # Mac system files
 .DS_Store
-EOF
+
+# Microsoft Office / temp lock files (created while a file is open)
+~$*
+
+# Stale pre-fix chart/report artifacts -- generated before the repository
+# ID correction (2/4 -> 11/20) and the classification bugfixes, so they no
+# longer match the current pipeline's output. Superseded by:
+# Repository_11_QD_PROJECT_Chart.svg, Repository_20_QD_PROJECT_Chart.svg,
+# SQ26_Classification_Report.pdf/.docx
+Plot3_File_Extensions.png
+Repository_2_Chart.png
+Repository_4_Chart.png
+repo_2_histogram.svg
+repo_4_histogram.svg
+repo_12_chart.svg
+SQ26_Final_Report.pdf
+
+# Local copies of course-provided reference material -- not needed to run
+# the code (isic_taxonomy.py reads ISIC5_Exp_Notes_11Mar2024.xlsx from the
+# repo root, not from here) and not something the student authored.
+QARCHEIVE/
+
+# This session's run logs
+phase1.log
+phase2.log

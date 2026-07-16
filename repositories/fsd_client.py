@@ -116,27 +116,35 @@ class FSDClient:
                         "uploader": "",
                     })
 
-                    # Only queue data ZIP if OAI confirms open access (Condition A)
-                    if self._check_open_access(study_id):
-                        zip_url = (
-                            f"https://services.fsd.tuni.fi/catalogue"
-                            f"/{study_id}/download?lang=en&study_language=en"
-                        )
-                        # Double-check with HEAD probe to avoid saving HTML pages
-                        if self._is_real_file(zip_url):
-                            logger.info(f"  [OPEN] {study_id} queued for download")
-                            tasks.append({
-                                "url": zip_url,
-                                "filename": f"{study_id}_data.zip",
-                                "repository": "FSD",
-                                "description": title,
-                                "license": "open",
-                                "uploader": "",
-                            })
-                        else:
-                            logger.info(f"  [RESTRICTED] {study_id} — HEAD probe blocked")
-                    else:
-                        logger.info(f"  [RESTRICTED] {study_id} — login required")
+                    # Always queue the data ZIP, even when it looks restricted.
+                    # Previously this only queued open-access (Condition A) studies,
+                    # so restricted studies were silently dropped and nothing ever
+                    # got recorded as FAILED_LOGIN_REQUIRED for the authenticated
+                    # Playwright phase to retry. FSD has no separate "/download"
+                    # endpoint (that 404s) -- the real download link only appears
+                    # embedded in the study's own tab=download page, and only once
+                    # authenticated; an anonymous request gets HTTP 200 with an
+                    # inactive placeholder, not 401/403. downloader.py detects that
+                    # HTML placeholder via Content-Type and marks it
+                    # FAILED_LOGIN_REQUIRED so fsd_playwright.py can log in and
+                    # retry it for real.
+                    zip_url = (
+                        f"https://services.fsd.tuni.fi/catalogue"
+                        f"/{study_id}?tab=download&lang=en&study_language=en"
+                    )
+                    is_open = self._check_open_access(study_id)
+                    if is_open and not self._is_real_file(zip_url):
+                        logger.info(f"  [RESTRICTED] {study_id} — HEAD probe blocked")
+                        is_open = False
+                    logger.info(f"  [{'OPEN' if is_open else 'RESTRICTED'}] {study_id} queued for download")
+                    tasks.append({
+                        "url": zip_url,
+                        "filename": f"{study_id}_data.zip",
+                        "repository": "FSD",
+                        "description": title,
+                        "license": "open" if is_open else "",
+                        "uploader": "",
+                    })
 
                     time.sleep(0.3)  # Small delay per study to be polite
 

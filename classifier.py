@@ -1,118 +1,174 @@
-import re
-from collections import defaultdict
-from database.database import MetadataDatabase
+import os
+import shutil
+import sqlite3
+import warnings
+
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
+from sklearn.metrics.pairwise import cosine_similarity
+
+from config import QDA_EXTENSIONS, PRIMARY_EXTENSIONS
+from isic_taxonomy import load_divisions, ISIC_FILE
 from logger import logger
 
-class AdvancedISICClassifier:
-    def __init__(self, db):
-        self.db = db
-        
-        # Expanded ISIC Rev. 5 Taxonomy to match the broad scope of your config.py
-        self.taxonomy = {
-            "Division 72: Scientific research and development": [
-                r"\bresearch\b", r"\bscience\b", r"\blaboratory\b", r"\bstudy\b", r"\bexperiment\b",
-                r"\bethnography\b", r"\bmethodology\b", r"\bphenomenology\b", r"\bqualitative\b"
-            ],
-            "Division 85: Education": [
-                r"\beducation\b", r"\bschool\b", r"\buniversity\b", r"\bstudent\b", r"\bteacher\b", 
-                r"\blearning\b", r"\bpedagogy\b", r"\bacademic\b", r"\bcurriculum\b"
-            ],
-            "Division 86: Human health activities": [
-                r"\bhealth\b", r"\bmedical\b", r"\bpatient\b", r"\bdisease\b", r"\bclinical\b", 
-                r"\bhospital\b", r"\bnursing\b", r"\bpsychology\b", r"\btherapy\b"
-            ],
-            "Division 84: Public administration and defence": [
-                r"\bgovernment\b", r"\bpolicy\b", r"\bpublic sector\b", r"\bmunicipality\b", 
-                r"\bcivic\b", r"\binstitution\b"
-            ],
-            "Division 94: Activities of membership organizations": [
-                r"\bunion\b", r"\bngo\b", r"\bnon-profit\b", r"\bassociation\b", r"\bcommunity\b", 
-                r"\bsociety\b"
-            ],
-            "Division 62: Computer programming and consultancy": [
-                r"\bsoftware\b", r"\bit\b", r"\btechnology\b", r"\bprogramming\b", r"\bdata\b", 
-                r"\balgorithm\b", r"\bdigital\b"
-            ]
-        }
+warnings.filterwarnings('ignore')
 
-        # Words to ignore so we don't fill the KEYWORDS table with junk
-        self.stop_words = {
-            "without", "through", "between", "because", "therefore", "however", 
-            "although", "another", "against", "further", "whether", "during",
-            "should", "would", "could", "project", "dataset", "version"
-        }
+DATABASE_NAME = "23088045-sq26.db"
+CLASSIFICATION_DB = "23088045-sq26-classification.db"
 
-    def clean_text(self, text):
-        if not text: 
-            return ""
-        # Remove URLs and special characters, convert to lowercase
-        text = re.sub(r'http\S+', '', text)
-        text = re.sub(r'[^a-zA-Z\s]', ' ', text)
-        return text.lower()
+QDA_EXTS = set(e.lower() for e in QDA_EXTENSIONS)
+PRIMARY_EXTS = set(e.lower() for e in PRIMARY_EXTENSIONS)
 
-    def extract_tags(self, cleaned_text):
-        if not cleaned_text: 
-            return []
-        words = cleaned_text.split()
-        
-        # Extract meaningful words (6+ letters) that are NOT in the stop_words list
-        tags = [w for w in words if len(w) >= 6 and w not in self.stop_words]
-        
-        # Return the top 6 unique tags to keep the database optimized
-        unique_tags = list(dict.fromkeys(tags))[:6]
-        return unique_tags
+# Words like "research"/"study"/"data" are boilerplate on a *qualitative
+# research data* archive -- nearly every project title contains them
+# ("Data for: A Qualitative Study of..."). Standard English stopword lists
+# don't catch these because they're not generic English function words.
+# Left unfiltered, they get inflated IDF weight (they're rare across the
+# 87 ISIC division blurbs, appearing mostly in N72 "Scientific research and
+# development"), which systematically drags nearly every project toward
+# N72/N73 regardless of actual subject matter.
+DOMAIN_GENERIC_STOPWORDS = {
+    'research', 'study', 'studies', 'data', 'dataset', 'datasets',
+    'project', 'qualitative', 'analysis', 'supplementary', 'supporting',
+}
+CUSTOM_STOP_WORDS = list(ENGLISH_STOP_WORDS.union(DOMAIN_GENERIC_STOPWORDS))
 
-    def classify(self, text):
-        cleaned_text = self.clean_text(text)
-        if not cleaned_text: 
-            return "Unclassified"
-            
-        scores = defaultdict(int)
-        for division, patterns in self.taxonomy.items():
-            for pattern in patterns:
-                matches = len(re.findall(pattern, cleaned_text))
-                if matches > 0:
-                    scores[division] += matches
-                    
-        # Return the division with the highest score
-        if scores:
-            return max(scores, key=scores.get)
-        return "Unclassified"
 
-    def run(self):
-        logger.info("Initializing ISIC Rev. 5 Classification into KEYWORDS table...")
-        
-        # Fetch projects from the normalized database
-        unclassified_projects = self.db.get_unclassified_projects()
-        
-        if not unclassified_projects:
-            logger.info("All projects are fully classified. No new records found.")
-            return
+def setup_database():
+    shutil.copy(DATABASE_NAME, CLASSIFICATION_DB)
+    conn = sqlite3.connect(CLASSIFICATION_DB, timeout=30.0)
+    cur = conn.cursor()
+    for col in ['primary_class', 'secondary_class', 'project_type']:
+        try:
+            cur.execute(f"ALTER TABLE PROJECTS ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass
+    try:
+        cur.execute("ALTER TABLE FILES ADD COLUMN class TEXT")
+    except sqlite3.OperationalError:
+        pass
 
-        success_count = 0
-        
-        for proj_id, title, description in unclassified_projects:
-            # Safely handle None types to prevent concatenation crashes
-            safe_title = title or ""
-            safe_desc = description or ""
-            context_text = f"{safe_title} {safe_desc}"
-            
-            isic_division = self.classify(context_text)
-            tags = self.extract_tags(self.clean_text(context_text))
-            
-            if isic_division != "Unclassified":
-                # Insert ISIC classification as a structured keyword
-                self.db.add_keyword(proj_id, f"ISIC:{isic_division}")
-                success_count += 1
-                
-            # Insert the cleaned, auto-generated descriptive tags
-            for tag in tags:
-                self.db.add_keyword(proj_id, tag)
-                
-        logger.info(f"Classification Complete. Successfully mapped {success_count} new projects.")
+    # Reset old classifications so this can be re-run with current parameters
+    cur.execute("UPDATE PROJECTS SET primary_class = NULL, secondary_class = NULL, project_type = NULL")
+    cur.execute("UPDATE FILES SET class = NULL")
+    conn.commit()
+    return conn
+
+
+def assign_project_types(conn):
+    """PROJECT_TYPE per rubric (Part 2 Step 1):
+    QDA_PROJECT   -> has a file with a QDA extension
+    QD_PROJECT    -> not QDA_PROJECT, but has a primary-data file
+    OTHER_PROJECT -> not QD_PROJECT, but has at least one file
+    NOT_A_PROJECT -> no files at all
+    """
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM PROJECTS")
+    project_ids = [row[0] for row in cur.fetchall()]
+
+    for pid in project_ids:
+        cur.execute("SELECT file_type FROM FILES WHERE project_id = ?", (pid,))
+        exts = {f".{(row[0] or '').lower().lstrip('.')}" for row in cur.fetchall() if row[0]}
+
+        if exts & QDA_EXTS:
+            project_type = "QDA_PROJECT"
+        elif exts & PRIMARY_EXTS:
+            project_type = "QD_PROJECT"
+        elif exts:
+            project_type = "OTHER_PROJECT"
+        else:
+            project_type = "NOT_A_PROJECT"
+
+        cur.execute("UPDATE PROJECTS SET project_type = ? WHERE id = ?", (project_type, pid))
+    conn.commit()
+    logger.info(f"Assigned project_type for {len(project_ids)} projects")
+
+
+def train_classifier():
+    """Labels are short ISIC division codes (e.g. "R88"), not the full
+    class name -- primary_class/secondary_class store the code alone, and
+    the report expands codes to full names via isic_taxonomy.full_label()
+    when displaying (rubric slide 30.i wants the full name as the bin
+    label, but the stored classification value should be the code)."""
+    divisions = load_divisions()
+
+    # max_df=0.7: ignore words in >70% of docs (drops generic noise like "research", "data")
+    # min_df=2: ignore words that appear only once (drops typos/one-off noise)
+    vectorizer = TfidfVectorizer(stop_words=CUSTOM_STOP_WORDS, max_df=0.7, min_df=2)
+    tfidf_matrix = vectorizer.fit_transform(divisions['corpus'])
+
+    return vectorizer, tfidf_matrix, divisions['code'].tolist()
+
+
+def _top2_labels(doc, vectorizer, tfidf_matrix, labels):
+    vec = vectorizer.transform([doc])
+    if vec.nnz == 0:
+        return None, None
+    sims = cosine_similarity(vec, tfidf_matrix).flatten()
+    top2_idx = sims.argsort()[-2:][::-1]
+    return labels[top2_idx[0]], labels[top2_idx[1]]
+
+
+def classify_projects(conn, vectorizer, tfidf_matrix, labels):
+    cur = conn.cursor()
+    cur.execute("SELECT id, title, description FROM PROJECTS")
+    projects = cur.fetchall()
+
+    for pid, title, desc in projects:
+        doc = f"{title or ''} {desc or ''}".strip()
+        primary, secondary = _top2_labels(doc, vectorizer, tfidf_matrix, labels)
+        conn.execute("UPDATE PROJECTS SET primary_class = ?, secondary_class = ? WHERE id = ?",
+                     (primary, secondary, pid))
+    conn.commit()
+    logger.info(f"Classified {len(projects)} projects")
+
+
+def classify_files(conn, vectorizer, tfidf_matrix, labels):
+    """Part 2 Step 3: for QDA_PROJECT and QD_PROJECT types, classify each
+    primary data file individually, not just the project as a whole.
+    File content isn't extracted (Tier 2 would parse DOC/TXT bodies), so the
+    document here is the project's own title/description plus the file name
+    -- the metadata-only (Tier 1) signal available today."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT f.id, f.file_name, f.file_type, p.title, p.description
+        FROM FILES f
+        JOIN PROJECTS p ON f.project_id = p.id
+        WHERE p.project_type IN ('QDA_PROJECT', 'QD_PROJECT')
+    """)
+    files = cur.fetchall()
+
+    classified = 0
+    for fid, file_name, file_type, title, desc in files:
+        ext = f".{(file_type or '').lower().lstrip('.')}"
+        if ext not in QDA_EXTS and ext not in PRIMARY_EXTS:
+            continue
+        doc = f"{title or ''} {desc or ''} {file_name or ''}".strip()
+        primary, _ = _top2_labels(doc, vectorizer, tfidf_matrix, labels)
+        if primary:
+            conn.execute("UPDATE FILES SET class = ? WHERE id = ?", (primary, fid))
+            classified += 1
+    conn.commit()
+    logger.info(f"Classified {classified} primary/QDA files")
+
+
+def main():
+    if not os.path.exists(DATABASE_NAME):
+        logger.error(f"{DATABASE_NAME} not found — run populate_from_disk.py first")
+        return
+    if not os.path.exists(ISIC_FILE):
+        logger.error(f"{ISIC_FILE} not found — needed to build the ISIC taxonomy")
+        return
+
+    conn = setup_database()
+    assign_project_types(conn)
+
+    vectorizer, tfidf_matrix, labels = train_classifier()
+    classify_projects(conn, vectorizer, tfidf_matrix, labels)
+    classify_files(conn, vectorizer, tfidf_matrix, labels)
+
+    conn.close()
+    logger.info(f"Classification complete -> {CLASSIFICATION_DB}")
+
 
 if __name__ == "__main__":
-    db = MetadataDatabase()
-    classifier = AdvancedISICClassifier(db)
-    classifier.run()
-    db.close()
+    main()
